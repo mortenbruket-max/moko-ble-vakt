@@ -75,7 +75,7 @@ details button { margin-top: 8px; font-size: 13px; padding: 6px 10px; }
   <button id="day">Last ned siste døgn</button>
   <button id="csv">Rålogg denne økten</button>
   <label class="chk"><input type="checkbox" id="onlyMoko" checked> Bare MOKO-enheter</label>
-  <label class="chk"><input type="checkbox" id="gateway"> Gateway-modus (start selv, overvåk skanningen)</label>
+  <label class="chk"><input type="checkbox" id="gateway"> Gateway-modus (overvåk skanningen over natten)</label>
   <span id="status" class="status">Ikke startet</span>
 </div>
 <p id="saved" class="status"></p>
@@ -419,24 +419,27 @@ $('stop').onclick = () => {
   $('status').textContent = 'Stoppet'; $('start').hidden = false; $('stop').hidden = true;
 };
 
-// Gateway-modus: start skanning selv når siden åpnes, og start den på nytt hvis det blir stille i 2 minutter
-// (Android/Chrome kan stoppe skanningen i det stille over natten)
+// Gateway-modus: overvåk skanningen og si tydelig fra om den stopper. Chrome krever et trykk på skjermen
+// for å starte skanning, så siden kan ikke starte (eller starte på nytt) av seg selv.
 $('gateway').checked = store.get('gateway', false);
 $('gateway').onchange = () => { store.set('gateway', $('gateway').checked); $('gwstat').hidden = !$('gateway').checked; };
 $('gwstat').hidden = !$('gateway').checked;
-setInterval(async () => {
-  if (!$('gateway').checked) return;
-  const quiet = Date.now() - gw.last;
-  if (!scan || !scan.active || quiet > 120000) {
-    if (await startScan()) gw.restarts++;
-  }
+let gwStopped = false;
+setInterval(() => {
+  if (!$('gateway').checked || !gw.since) return;
+  const stopped = !scan || !scan.active || Date.now() - gw.last > 120000;
+  if (stopped && !gwStopped) { gw.restarts++; log.push([new Date().toISOString(), 'GATEWAY', 'skanning stoppet', '', '', '', '', '', '', '', '', '']); }
+  gwStopped = stopped;
+  const box = $('support');
+  if (stopped) { box.innerHTML = '<b>Skanningen har stoppet.</b> Trykk «Start skanning» for å fortsette loggingen.'; box.hidden = false; }
+  else if (box.textContent.startsWith('Skanningen har stoppet')) box.hidden = true;
 }, 30000);
 setInterval(() => {
   if (!$('gateway').checked) return;
   const h = gw.since ? (Date.now() - gw.since) / 3600000 : 0;
   $('gwstat').textContent = gw.since
-    ? `Gateway: skannet ${Math.floor(h)} t ${Math.round((h % 1) * 60)} min · ${gw.packets.toLocaleString('no')} pakker · siste ${fmtAge(gw.last)} siden · ${gw.restarts} omstarter`
-    : 'Gateway: venter på å starte skanning';
+    ? `Gateway: skannet ${Math.floor(h)} t ${Math.round((h % 1) * 60)} min · ${gw.packets.toLocaleString('no')} pakker · siste ${fmtAge(gw.last)} siden · ${gw.restarts} avbrudd`
+    : 'Gateway: trykk «Start skanning» én gang for å starte loggingen';
 }, 5000);
 $('csv').onclick = () => {
   const head = 'tid,id,navn,plassering,rssi,temp_c,fukt_pct,vib_rms_mg,normal_rms_mg,avvik_x,batteri_mv,radata';
@@ -467,7 +470,7 @@ addEventListener('pagehide',() => { devices.forEach(d => { if (d.min) flushMinut
 // Vis lagrede sensorer med en gang, før de er hørt igjen
 for (const [id, k] of Object.entries(known)) if (!devices.has(id)) devices.set(id, newDevice(id, k.name));
 render();
-if (checkSupport() && $('gateway').checked) startScan();
+checkSupport();
 </script>
 </body>
 </html>
