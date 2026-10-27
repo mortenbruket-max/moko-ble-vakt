@@ -354,12 +354,10 @@ function render() {
     set('age', fmtAge(d.seen));
     const learnBtn = el.querySelector('[data-b="learn"]');
     learnBtn.hidden = !d.acc.length;
+    el.querySelector('[data-b="reset"]').hidden = !base || !!d.learn || !d.heard;
     if (!d.heard) {
       set('normtxt', 'Venter på sensoren – viser siste lagrede verdier' + (base ? ` · normal ${base.rms.toFixed(1)} mg` : ''));
-      el.querySelector('[data-b="reset"]').hidden = true;
-    } else
-    el.querySelector('[data-b="reset"]').hidden = !base || !!d.learn;
-    if (d.learn) {
+    } else if (d.learn) {
       const left = Math.max(0, d.learn.until - Date.now()), m = Math.floor(left / 60000), s = Math.floor(left / 1000) % 60;
       set('normtxt', `Lærer normal … ${m}:${String(s).padStart(2, '0')} igjen (${d.learn.values.length} målinger)`);
       learnBtn.textContent = 'Avbryt';
@@ -428,7 +426,11 @@ $('day').onclick = () => {
   a.href = URL.createObjectURL(new Blob(['﻿' + head + '\n' + rows.join('\n')], { type: 'text/csv' }));
   a.download = 'ble-vakt-dogn-' + ts(Date.now()).replace(/[ :]/g, '-') + '.csv'; a.click();
 };
-addEventListener('pagehide', () => { devices.forEach(d => { if (d.min) flushMinute(d); }); store.set('known', known); });
+// Skjermlåsen slippes når siden skjules; be om den igjen når den er synlig og skanner (viktig over natten)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && scan?.active) navigator.wakeLock?.request('screen').catch(() => {});
+});
+addEventListener('pagehide',() => { devices.forEach(d => { if (d.min) flushMinute(d); }); store.set('known', known); });
 // Vis lagrede sensorer med en gang, før de er hørt igjen
 for (const [id, k] of Object.entries(known)) if (!devices.has(id)) devices.set(id, newDevice(id, k.name));
 render();
