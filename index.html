@@ -130,15 +130,19 @@ function decodeSensorInfo(dv) {
 // Produksjonstest-ramme (0xEB01): batteri i byte 1-2
 function decodeProdTest(dv) { return dv.byteLength >= 3 ? { frame: 'MOKO prodtest', batt_mV: dv.getUint16(1) } : {}; }
 
-// Vibrasjons-RMS i mg over siste minutt. Sensoren sender ett øyeblikksbilde av X/Y/Z per sekund,
-// tatt på tilfeldige steder i svingningen, så spredningen rundt snittet (tyngdekraft og montering
-// trukket fra per akse) følger hvor kraftig maskinen vibrerer.
-const RMS_WINDOW = 60, RMS_MIN = 10, BASE_FLOOR = 2;
+// Vibrasjons-RMS i mg over siste ~20 s. Sensoren sender ett øyeblikksbilde av X/Y/Z per sekund,
+// tatt på tilfeldige steder i svingningen. Vi bruker endringen mellom påfølgende målinger:
+// tyngdekraft og stilling faller bort med en gang (flytter du sensoren gir det bare ett hopp),
+// og for ukorrelerte målinger er RMS(Δ)/√2 lik vibrasjonens RMS.
+const RMS_WINDOW = 20, RMS_MIN = 6, BASE_FLOOR = 2;
 function vibration(d) {
   const w = d.acc.slice(-RMS_WINDOW);
   if (w.length < RMS_MIN) return null;
-  const mean = [0, 1, 2].map(i => w.reduce((s, a) => s + a[i], 0) / w.length);
-  return Math.sqrt(w.reduce((s, a) => s + (a[0] - mean[0]) ** 2 + (a[1] - mean[1]) ** 2 + (a[2] - mean[2]) ** 2, 0) / w.length);
+  // Medianen av kvadratene i stedet for snittet, så ett enkelt hopp (sensoren flyttet) ikke drar opp tallet
+  const sq = [];
+  for (let i = 1; i < w.length; i++) sq.push((w[i][0] - w[i - 1][0]) ** 2 + (w[i][1] - w[i - 1][1]) ** 2 + (w[i][2] - w[i - 1][2]) ** 2);
+  const mean = sq.reduce((s, x) => s + x, 0) / sq.length, med = median(sq);
+  return Math.sqrt(Math.min(mean, med * 1.5) / 2);
 }
 const median = xs => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : null; };
 // Avvik = nåværende RMS delt på lært normal. Gulv på 2 mg så en helt stille maskin ikke gir store tall av støy.
