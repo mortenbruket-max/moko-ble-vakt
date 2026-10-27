@@ -58,6 +58,8 @@ pre { font: 12px/1.5 var(--font-mono); white-space: pre-wrap; word-break: break-
   padding-top: 8px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
 .norm .btns { display: flex; gap: 6px; }
 .norm button { font-size: 13px; padding: 6px 10px; }
+#saved { margin: -4px 0 12px; }
+details button { margin-top: 8px; font-size: 13px; padding: 6px 10px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
@@ -70,10 +72,12 @@ pre { font: 12px/1.5 var(--font-mono); white-space: pre-wrap; word-break: break-
 <div class="bar">
   <button id="start" class="primary">Start skanning</button>
   <button id="stop" hidden>Stopp</button>
-  <button id="csv">Last ned logg (CSV)</button>
+  <button id="day">Last ned siste døgn</button>
+  <button id="csv">Rålogg denne økten</button>
   <label class="chk"><input type="checkbox" id="onlyMoko" checked> Bare MOKO-enheter</label>
   <span id="status" class="status">Ikke startet</span>
 </div>
+<p id="saved" class="status"></p>
 
 <div class="limits">
   <label>Varsel temp °C <input id="tWarn" type="number" value="55"></label>
@@ -95,7 +99,12 @@ const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? 
                 set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
 const places = store.get('places', {});
 const baselines = store.get('baselines', {});   // id -> { rms, at }: lært normalnivå per sensor
+const known = store.get('known', {});           // id -> { name, first, last }: alle sensorer appen har sett
+// Minuttlogg: [minutt-ms, id, temp, vib snitt, vib maks, avvik, fukt, batteri mV, rssi], holdes 48 t
+const HIST_KEEP = 48 * 3600000;
+const hist = store.get('hist', []);
 const devices = new Map();      // id -> tilstand
+const newDevice = (id, name) => ({ id, name, raw: {}, temps: [], acc: [], vib: [], vals: {}, seen: known[id]?.last ?? 0 });
 const log = [];                 // rader til CSV
 const MOKO_NAME = /^(MK|M4|M5|DL|BXP|BeaconX|MOKO|H4|H5|S0)/i;
 const UUID16 = n => `0000${n}-0000-1000-8000-00805f9b34fb`;
@@ -148,6 +157,33 @@ const median = xs => { const s = [...xs].sort((a, b) => a - b); return s.length 
 // Avvik = nåværende RMS delt på lært normal. Gulv på 2 mg så en helt stille maskin ikke gir store tall av støy.
 const deviation = d => baselines[d.id] && d.vals.vib != null ? d.vals.vib / Math.max(baselines[d.id].rms, BASE_FLOOR) : null;
 
+// ---- lagring ----
+const avg = xs => xs.length ? xs.reduce((s, x) => s + x, 0) / xs.length : null;
+const r1 = x => x == null ? null : Math.round(x * 10) / 10;
+function flushMinute(d) {
+  const m = d.min; d.min = null;
+  if (!m) return;
+  hist.push([m.t0, d.id, r1(avg(m.temps)), r1(avg(m.vibs)), r1(m.vibs.length ? Math.max(...m.vibs) : null),
+             m.dev == null ? null : Math.round(m.dev * 100) / 100, r1(m.hum), m.batt ?? null, m.rssi ?? null]);
+  const cut = Date.now() - HIST_KEEP;
+  while (hist.length && hist[0][0] < cut) hist.shift();
+  store.set('hist', hist);
+}
+// Sensorer som tier skal også få minuttet sitt lagret
+setInterval(() => { const cur = Math.floor(Date.now() / 60000) * 60000; devices.forEach(d => { if (d.min && d.min.t0 < cur) flushMinute(d); }); }, 15000);
+let knownSaved = 0;
+function rememberDevice(d) {
+  const k = known[d.id] || (known[d.id] = { first: Date.now() });
+  k.name = d.name; k.last = d.seen;
+  if (Date.now() - knownSaved > 30000) { store.set('known', known); knownSaved = Date.now(); }
+}
+function forgetDevice(id) {
+  delete known[id]; delete baselines[id]; delete places[id];
+  store.set('known', known); store.set('baselines', baselines); store.set('places', places);
+  devices.delete(id);
+  document.querySelector(`[data-id="${CSS.escape(id)}"]`)?.remove();
+}
+
 function startLearning(d) { d.learn = { until: Date.now() + Math.max(1, +$('learnMin').value || 10) * 60000, values: [] }; scheduleRender(); }
 function finishLearning(d) {
   const rms = median(d.learn.values);
@@ -166,7 +202,7 @@ function onAdvert(ev) {
   if ($('onlyMoko').checked && !isMoko) return;
 
   let d = devices.get(id);
-  if (!d) { d = { id, name, raw: {}, temps: [], acc: [], vib: [], vals: {} }; devices.set(id, d); }
+  if (!d) { d = newDevice(id, name); devices.set(id, d); }
   if (name) d.name = name;
   d.rssi = ev.rssi; d.seen = Date.now();
 
@@ -202,6 +238,15 @@ function onAdvert(ev) {
   d.frames = decoded.frame || d.frames;
   for (const k of ['temps', 'acc', 'vib']) if (d[k].length > 300) d[k].splice(0, d[k].length - 300);
 
+  // Samle til minuttloggen
+  const minute = Math.floor(Date.now() / 60000) * 60000;
+  if (d.min && d.min.t0 !== minute) flushMinute(d);
+  if (!d.min) d.min = { t0: minute, temps: [], vibs: [] };
+  if (decoded.temp != null && d.vals.temp === decoded.temp) d.min.temps.push(decoded.temp);
+  if (fresh && d.vals.vib != null) d.min.vibs.push(d.vals.vib);
+  Object.assign(d.min, { dev: deviation(d), hum: d.vals.hum, batt: d.vals.batt, rssi: ev.rssi });
+  rememberDevice(d);
+
   log.push([new Date().toISOString(), id, d.name, places[id] || '', ev.rssi, d.vals.temp ?? '', d.vals.hum ?? '', d.vals.vib?.toFixed(1) ?? '',
             baselines[id]?.rms.toFixed(1) ?? '', deviation(d)?.toFixed(2) ?? '', d.vals.batt ?? '',
             Object.entries(d.raw).map(([k, v]) => k + '=' + v).join(' ')]);
@@ -215,7 +260,7 @@ function scheduleRender() { if (!pending) { pending = true; requestAnimationFram
 
 function level(d) {
   const L = id => +$(id).value;
-  if (Date.now() - d.seen > 60000) return 'idle';
+  if (!d.seen || Date.now() - d.seen > 60000) return 'idle';
   // Med lært normal varsles det på avvik (× normal); uten brukes faste mg-grenser
   const dev = deviation(d), vib = d.vals.vib ?? 0, temp = d.vals.temp ?? -99;
   const vibCrit = dev != null ? dev >= L('xCrit') : vib >= L('vCrit');
@@ -225,6 +270,11 @@ function level(d) {
   return 'ok';
 }
 const LABEL = { ok: 'OK', warn: 'VARSEL', crit: 'ALARM', idle: 'STILLE' };
+function fmtAge(t) {
+  if (!t) return '–';
+  const s = Math.round((Date.now() - t) / 1000);
+  return s < 120 ? s + ' s' : s < 7200 ? Math.round(s / 60) + ' min' : s < 172800 ? Math.round(s / 3600) + ' t' : Math.round(s / 86400) + ' d';
+}
 
 function spark(cv, series, color) {
   const r = cv.getBoundingClientRect(), dpr = devicePixelRatio || 1;
@@ -242,6 +292,10 @@ function spark(cv, series, color) {
 
 function render() {
   const grid = $('grid');
+  const hours = hist.length ? (Date.now() - hist[0][0]) / 3600000 : 0;
+  $('saved').textContent = `${Object.keys(known).length} sensorer lagret · minuttlogg ${hist.length} rader` +
+    (hist.length ? `, ${hours < 1 ? Math.round(hours * 60) + ' min' : hours.toFixed(1).replace('.', ',') + ' t'} tilbake` : '') +
+    ' · logger bare mens siden er åpen og skanner';
   if (!devices.size) return;
   if (grid.querySelector('.empty')) grid.innerHTML = '';
   const css = getComputedStyle(document.documentElement);
@@ -263,7 +317,8 @@ function render() {
           <span class="btns"><button data-b="learn">Lær normal</button><button data-b="reset" hidden>Nullstill</button></span></div>
         <canvas data-c="temp" aria-label="Temperaturtrend"></canvas>
         <canvas data-c="vib" aria-label="Vibrasjonstrend"></canvas>
-        <details><summary>Rådata</summary><pre></pre></details>`;
+        <details><summary>Rådata</summary><pre></pre><button data-b="forget">Glem denne sensoren</button></details>`;
+      el.querySelector('[data-b="forget"]').addEventListener('click', () => forgetDevice(d.id));
       const inp = el.querySelector('.place'); inp.value = places[d.id] || '';
       inp.addEventListener('change', () => { places[d.id] = inp.value; store.set('places', places); });
       el.querySelector('[data-b="learn"]').addEventListener('click', () => {
@@ -286,7 +341,7 @@ function render() {
     set('vib', d.vals.vib != null ? d.vals.vib.toFixed(1) : d.acc.length ? `${d.acc.length}/${RMS_MIN}` : '–');
     set('dev', dev != null ? dev.toFixed(1).replace('.', ',') + '×' : '–');
     set('batt', d.vals.batt ? (d.vals.batt / 1000).toFixed(2) : '–'); set('hum', d.vals.hum?.toFixed(0) ?? '–');
-    set('age', Math.round((Date.now() - d.seen) / 1000) + ' s');
+    set('age', fmtAge(d.seen));
     const learnBtn = el.querySelector('[data-b="learn"]');
     learnBtn.hidden = !d.acc.length;
     el.querySelector('[data-b="reset"]').hidden = !base || !!d.learn;
@@ -345,6 +400,24 @@ $('csv').onclick = () => {
   a.href = URL.createObjectURL(new Blob([head + '\n' + body], { type: 'text/csv' }));
   a.download = 'moko-logg-' + new Date().toISOString().slice(0, 16).replace(/:/g, '') + '.csv'; a.click();
 };
+// Siste døgn fra minuttloggen, i norsk Excel-format (semikolon, desimalkomma, UTF-8 med BOM)
+$('day').onclick = () => {
+  devices.forEach(d => { if (d.min) flushMinute(d); });
+  const cut = Date.now() - 24 * 3600000, num = x => x == null ? '' : String(x).replace('.', ',');
+  const pad = n => String(n).padStart(2, '0');
+  const ts = t => { const d = new Date(t); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  const rows = hist.filter(r => r[0] >= cut).map(([t, id, temp, va, vm, dev, hum, batt, rssi]) =>
+    [ts(t), places[id] || '', known[id]?.name || '', id, num(temp), num(va), num(vm), num(dev), num(hum), batt ?? '', rssi ?? '']
+      .map(c => `"${String(c).replace(/"/g, '""')}"`).join(';'));
+  const head = 'tid;plassering;navn;sensor_id;temp_c;vib_rms_snitt_mg;vib_rms_maks_mg;avvik_x;fukt_pct;batteri_mv;signal_dbm';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['﻿' + head + '\n' + rows.join('\n')], { type: 'text/csv' }));
+  a.download = 'ble-vakt-dogn-' + ts(Date.now()).replace(/[ :]/g, '-') + '.csv'; a.click();
+};
+addEventListener('pagehide', () => { devices.forEach(d => { if (d.min) flushMinute(d); }); store.set('known', known); });
+// Vis lagrede sensorer med en gang, før de er hørt igjen
+for (const [id, k] of Object.entries(known)) if (!devices.has(id)) devices.set(id, newDevice(id, k.name));
+render();
 checkSupport();
 </script>
 </body>
