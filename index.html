@@ -104,7 +104,16 @@ const known = store.get('known', {});           // id -> { name, first, last }: 
 const HIST_KEEP = 48 * 3600000;
 const hist = store.get('hist', []);
 const devices = new Map();      // id -> tilstand
-const newDevice = (id, name) => ({ id, name, raw: {}, temps: [], acc: [], vib: [], vals: {}, seen: known[id]?.last ?? 0 });
+function newDevice(id, name) {
+  const d = { id, name, raw: {}, temps: [], acc: [], vib: [], vals: {}, seen: known[id]?.last ?? 0, heard: false };
+  // Start med siste kjente verdier fra minuttloggen til sensoren høres igjen
+  for (let i = hist.length - 1; i >= 0; i--) if (hist[i][1] === id) {
+    const [, , temp, vib, , , hum, batt] = hist[i];
+    Object.assign(d.vals, { temp: temp ?? undefined, vib: vib ?? undefined, hum: hum ?? undefined, batt: batt ?? undefined });
+    break;
+  }
+  return d;
+}
 const log = [];                 // rader til CSV
 const MOKO_NAME = /^(MK|M4|M5|DL|BXP|BeaconX|MOKO|H4|H5|S0)/i;
 const UUID16 = n => `0000${n}-0000-1000-8000-00805f9b34fb`;
@@ -204,6 +213,7 @@ function onAdvert(ev) {
   let d = devices.get(id);
   if (!d) { d = newDevice(id, name); devices.set(id, d); }
   if (name) d.name = name;
+  if (!d.heard) { d.heard = true; d.vals = {}; }   // dropp gamle verdier fra loggen når sensoren høres
   d.rssi = ev.rssi; d.seen = Date.now();
 
   const decoded = {};
@@ -344,6 +354,10 @@ function render() {
     set('age', fmtAge(d.seen));
     const learnBtn = el.querySelector('[data-b="learn"]');
     learnBtn.hidden = !d.acc.length;
+    if (!d.heard) {
+      set('normtxt', 'Venter på sensoren – viser siste lagrede verdier' + (base ? ` · normal ${base.rms.toFixed(1)} mg` : ''));
+      el.querySelector('[data-b="reset"]').hidden = true;
+    } else
     el.querySelector('[data-b="reset"]').hidden = !base || !!d.learn;
     if (d.learn) {
       const left = Math.max(0, d.learn.until - Date.now()), m = Math.floor(left / 60000), s = Math.floor(left / 1000) % 60;
