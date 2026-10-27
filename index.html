@@ -54,12 +54,16 @@ canvas { width: 100%; height: 56px; display: block; margin: 4px 0; }
 details { margin-top: 6px; } summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 pre { font: 12px/1.5 var(--font-mono); white-space: pre-wrap; word-break: break-all; margin: 6px 0 0; color: var(--muted); }
 .empty { color: var(--muted); padding: 24px 0; }
+.norm { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin: 8px 0 2px;
+  padding-top: 8px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+.norm .btns { display: flex; gap: 6px; }
+.norm button { font-size: 13px; padding: 6px 10px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
 <h1>Sortermaskin BLE-vakt</h1>
-<p class="sub">Telefonen lytter på MOKO-sensorene (M4 Pro, M5, DL002) og viser temperatur, vibrasjon og batteri.</p>
+<p class="sub">Telefonen lytter på MOKO-sensorene (M4 Pro, M5, H4 Pro, DL002) og viser temperatur, vibrasjon og batteri. Trykk «Lær normal» mens maskinen går som den skal, så varsler appen når vibrasjonen avviker.</p>
 
 <div id="support" class="notice" hidden></div>
 
@@ -74,8 +78,11 @@ pre { font: 12px/1.5 var(--font-mono); white-space: pre-wrap; word-break: break-
 <div class="limits">
   <label>Varsel temp °C <input id="tWarn" type="number" value="55"></label>
   <label>Alarm temp °C <input id="tCrit" type="number" value="70"></label>
-  <label>Varsel vibrasjon <input id="vWarn" type="number" value="80"></label>
-  <label>Alarm vibrasjon <input id="vCrit" type="number" value="200"></label>
+  <label>Varsel avvik × <input id="xWarn" type="number" step="0.5" value="2"></label>
+  <label>Alarm avvik × <input id="xCrit" type="number" step="0.5" value="4"></label>
+  <label>Læretid min <input id="learnMin" type="number" value="10"></label>
+  <label>Uten normal: varsel mg <input id="vWarn" type="number" value="80"></label>
+  <label>alarm mg <input id="vCrit" type="number" value="200"></label>
 </div>
 
 <div id="grid" class="grid"><p class="empty">Trykk «Start skanning». Sensorene dukker opp her etter hvert som de sender.</p></div>
@@ -87,6 +94,7 @@ const hex = dv => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].m
 const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
                 set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
 const places = store.get('places', {});
+const baselines = store.get('baselines', {});   // id -> { rms, at }: lært normalnivå per sensor
 const devices = new Map();      // id -> tilstand
 const log = [];                 // rader til CSV
 const MOKO_NAME = /^(MK|M4|M5|DL|BXP|BeaconX|MOKO|H4|H5|S0)/i;
@@ -122,12 +130,27 @@ function decodeSensorInfo(dv) {
 // Produksjonstest-ramme (0xEB01): batteri i byte 1-2
 function decodeProdTest(dv) { return dv.byteLength >= 3 ? { frame: 'MOKO prodtest', batt_mV: dv.getUint16(1) } : {}; }
 
-// Vibrasjonsindeks: standardavvik i |a| over de siste prøvene (rå akselerometer-enheter)
+// Vibrasjons-RMS i mg over siste minutt. Sensoren sender ett øyeblikksbilde av X/Y/Z per sekund,
+// tatt på tilfeldige steder i svingningen, så spredningen rundt snittet (tyngdekraft og montering
+// trukket fra per akse) følger hvor kraftig maskinen vibrerer.
+const RMS_WINDOW = 60, RMS_MIN = 10, BASE_FLOOR = 2;
 function vibration(d) {
-  const m = d.acc.slice(-20).map(a => Math.hypot(a[0], a[1], a[2]));
-  if (m.length < 3) return null;
-  const mean = m.reduce((s, x) => s + x, 0) / m.length;
-  return Math.sqrt(m.reduce((s, x) => s + (x - mean) ** 2, 0) / m.length);
+  const w = d.acc.slice(-RMS_WINDOW);
+  if (w.length < RMS_MIN) return null;
+  const mean = [0, 1, 2].map(i => w.reduce((s, a) => s + a[i], 0) / w.length);
+  return Math.sqrt(w.reduce((s, a) => s + (a[0] - mean[0]) ** 2 + (a[1] - mean[1]) ** 2 + (a[2] - mean[2]) ** 2, 0) / w.length);
+}
+const median = xs => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : null; };
+// Avvik = nåværende RMS delt på lært normal. Gulv på 2 mg så en helt stille maskin ikke gir store tall av støy.
+const deviation = d => baselines[d.id] && d.vals.vib != null ? d.vals.vib / Math.max(baselines[d.id].rms, BASE_FLOOR) : null;
+
+function startLearning(d) { d.learn = { until: Date.now() + Math.max(1, +$('learnMin').value || 10) * 60000, values: [] }; scheduleRender(); }
+function finishLearning(d) {
+  const rms = median(d.learn.values);
+  d.learn = null;
+  if (rms == null) return;
+  baselines[d.id] = { rms, at: Date.now() };
+  store.set('baselines', baselines);
 }
 
 function onAdvert(ev) {
@@ -156,15 +179,27 @@ function onAdvert(ev) {
   if (decoded.temp != null && decoded.temp > -40 && decoded.temp < 125) { d.vals.temp = decoded.temp; d.temps.push(decoded.temp); }
   if (decoded.hum != null && decoded.hum <= 100) d.vals.hum = decoded.hum;
   if (decoded.batt_mV) d.vals.batt = decoded.batt_mV;
-  if (decoded.ax != null) {
-    d.acc.push([decoded.ax, decoded.ay, decoded.az]); d.vals.xyz = `${decoded.ax} / ${decoded.ay} / ${decoded.az} mg`;
+  // Chrome kan levere samme pakke flere ganger; tell bare nye målinger (sensoren sender ca. 1 per sekund)
+  const fresh = decoded.ax != null && !(d.lastAcc && Date.now() - d.lastAcc.t < 500 &&
+    d.lastAcc.v[0] === decoded.ax && d.lastAcc.v[1] === decoded.ay && d.lastAcc.v[2] === decoded.az);
+  if (fresh) {
+    const v3 = [decoded.ax, decoded.ay, decoded.az];
+    d.acc.push(v3); d.lastAcc = { t: Date.now(), v: v3 };
+    d.vals.xyz = `${decoded.ax} / ${decoded.ay} / ${decoded.az} mg`;
     d.vals.moving = decoded.moving;
-    const v = vibration(d); if (v != null) { d.vals.vib = v; d.vib.push(v); }
+    const v = vibration(d);
+    if (v != null) {
+      d.vals.vib = v;
+      if (!d.lastTrend || Date.now() - d.lastTrend > 10000) { d.vib.push(v); d.lastTrend = Date.now(); }   // trendpunkt hvert 10. sekund
+      if (d.learn) d.learn.values.push(v);
+    }
+    if (d.learn && Date.now() >= d.learn.until) finishLearning(d);
   }
   d.frames = decoded.frame || d.frames;
   for (const k of ['temps', 'acc', 'vib']) if (d[k].length > 300) d[k].splice(0, d[k].length - 300);
 
-  log.push([new Date().toISOString(), id, d.name, places[id] || '', ev.rssi, d.vals.temp ?? '', d.vals.hum ?? '', d.vals.vib?.toFixed(1) ?? '', d.vals.batt ?? '',
+  log.push([new Date().toISOString(), id, d.name, places[id] || '', ev.rssi, d.vals.temp ?? '', d.vals.hum ?? '', d.vals.vib?.toFixed(1) ?? '',
+            baselines[id]?.rms.toFixed(1) ?? '', deviation(d)?.toFixed(2) ?? '', d.vals.batt ?? '',
             Object.entries(d.raw).map(([k, v]) => k + '=' + v).join(' ')]);
   if (log.length > 50000) log.splice(0, 10000);
   scheduleRender();
@@ -177,8 +212,12 @@ function scheduleRender() { if (!pending) { pending = true; requestAnimationFram
 function level(d) {
   const L = id => +$(id).value;
   if (Date.now() - d.seen > 60000) return 'idle';
-  if ((d.vals.temp ?? -99) >= L('tCrit') || (d.vals.vib ?? 0) >= L('vCrit')) return 'crit';
-  if ((d.vals.temp ?? -99) >= L('tWarn') || (d.vals.vib ?? 0) >= L('vWarn')) return 'warn';
+  // Med lært normal varsles det på avvik (× normal); uten brukes faste mg-grenser
+  const dev = deviation(d), vib = d.vals.vib ?? 0, temp = d.vals.temp ?? -99;
+  const vibCrit = dev != null ? dev >= L('xCrit') : vib >= L('vCrit');
+  const vibWarn = dev != null ? dev >= L('xWarn') : vib >= L('vWarn');
+  if (temp >= L('tCrit') || vibCrit) return 'crit';
+  if (temp >= L('tWarn') || vibWarn) return 'warn';
   return 'ok';
 }
 const LABEL = { ok: 'OK', warn: 'VARSEL', crit: 'ALARM', idle: 'STILLE' };
@@ -210,17 +249,27 @@ function render() {
         <input class="place" id="place-${d.id.replace(/\W/g, '')}" placeholder="Plassering, f.eks. Motor 3 – drivlager">
         <div class="vals">
           <div class="v"><b data-k="temp">–</b><span>Temp °C</span></div>
-          <div class="v"><b data-k="vib">–</b><span>Vibrasjon mg</span></div>
+          <div class="v"><b data-k="vib">–</b><span>Vibrasjon RMS mg</span></div>
+          <div class="v"><b data-k="dev">–</b><span>Avvik × normal</span></div>
           <div class="v"><b data-k="batt">–</b><span>Batteri V</span></div>
           <div class="v"><b data-k="hum">–</b><span>Fukt %</span></div>
-          <div class="v"><b data-k="rssi">–</b><span>Signal dBm</span></div>
           <div class="v"><b data-k="age">–</b><span>Sist hørt</span></div>
         </div>
+        <div class="norm"><span data-k="normtxt"></span>
+          <span class="btns"><button data-b="learn">Lær normal</button><button data-b="reset" hidden>Nullstill</button></span></div>
         <canvas data-c="temp" aria-label="Temperaturtrend"></canvas>
         <canvas data-c="vib" aria-label="Vibrasjonstrend"></canvas>
         <details><summary>Rådata</summary><pre></pre></details>`;
       const inp = el.querySelector('.place'); inp.value = places[d.id] || '';
       inp.addEventListener('change', () => { places[d.id] = inp.value; store.set('places', places); });
+      el.querySelector('[data-b="learn"]').addEventListener('click', () => {
+        const dd = devices.get(d.id);
+        if (dd.learn) { dd.learn = null; } else startLearning(dd);
+        scheduleRender();
+      });
+      el.querySelector('[data-b="reset"]').addEventListener('click', () => {
+        delete baselines[d.id]; store.set('baselines', baselines); scheduleRender();
+      });
       grid.appendChild(el);
     }
     const lv = level(d);
@@ -228,15 +277,31 @@ function render() {
     el.querySelector('.name').textContent = d.name || 'Ukjent ' + d.id.slice(0, 6);
     const pill = el.querySelector('.pill'); pill.className = 'pill ' + lv; pill.textContent = LABEL[lv];
     const set = (k, v) => el.querySelector(`[data-k="${k}"]`).textContent = v;
-    set('temp', d.vals.temp?.toFixed(1) ?? '–'); set('vib', d.vals.vib?.toFixed(0) ?? '–');
+    const dev = deviation(d), base = baselines[d.id];
+    set('temp', d.vals.temp?.toFixed(1) ?? '–');
+    set('vib', d.vals.vib != null ? d.vals.vib.toFixed(1) : d.acc.length ? `${d.acc.length}/${RMS_MIN}` : '–');
+    set('dev', dev != null ? dev.toFixed(1).replace('.', ',') + '×' : '–');
     set('batt', d.vals.batt ? (d.vals.batt / 1000).toFixed(2) : '–'); set('hum', d.vals.hum?.toFixed(0) ?? '–');
-    set('rssi', d.rssi ?? '–'); set('age', Math.round((Date.now() - d.seen) / 1000) + ' s');
+    set('age', Math.round((Date.now() - d.seen) / 1000) + ' s');
+    const learnBtn = el.querySelector('[data-b="learn"]');
+    learnBtn.hidden = !d.acc.length;
+    el.querySelector('[data-b="reset"]').hidden = !base || !!d.learn;
+    if (d.learn) {
+      const left = Math.max(0, d.learn.until - Date.now()), m = Math.floor(left / 60000), s = Math.floor(left / 1000) % 60;
+      set('normtxt', `Lærer normal … ${m}:${String(s).padStart(2, '0')} igjen (${d.learn.values.length} målinger)`);
+      learnBtn.textContent = 'Avbryt';
+    } else {
+      set('normtxt', !d.acc.length ? 'Ingen akselerometerdata fra denne sensoren'
+        : base ? `Normal: ${base.rms.toFixed(1)} mg, lært ${new Date(base.at).toLocaleString('no', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`
+        : 'Ingen normal lært ennå – faste mg-grenser brukes');
+      learnBtn.textContent = base ? 'Lær på nytt' : 'Lær normal';
+    }
     el.querySelector('[data-c="temp"]').hidden = d.temps.length < 2;
     el.querySelector('[data-c="vib"]').hidden = d.vib.length < 2;
     spark(el.querySelector('[data-c="temp"]'), d.temps.slice(-120), css.getPropertyValue('--accent'));
     spark(el.querySelector('[data-c="vib"]'), d.vib.slice(-120), css.getPropertyValue('--warn'));
     el.querySelector('pre').textContent = `Ramme: ${d.frames || '–'}\nX/Y/Z: ${d.vals.xyz || '–'}` +
-      (d.vals.moving == null ? '' : d.vals.moving ? ' (i bevegelse)' : ' (i ro)') + `\nID: ${d.id}\n` + Object.entries(d.raw).map(([k, v]) => k + ': ' + v).join('\n');
+      (d.vals.moving == null ? '' : d.vals.moving ? ' (i bevegelse)' : ' (i ro)') + `\nSignal: ${d.rssi ?? '–'} dBm\nID: ${d.id}\n` + Object.entries(d.raw).map(([k, v]) => k + ': ' + v).join('\n');
   }
 }
 setInterval(scheduleRender, 2000);
@@ -270,7 +335,7 @@ $('stop').onclick = () => {
   $('status').textContent = 'Stoppet'; $('start').hidden = false; $('stop').hidden = true;
 };
 $('csv').onclick = () => {
-  const head = 'tid,id,navn,plassering,rssi,temp_c,fukt_pct,vibrasjon,batteri_mv,radata';
+  const head = 'tid,id,navn,plassering,rssi,temp_c,fukt_pct,vib_rms_mg,normal_rms_mg,avvik_x,batteri_mv,radata';
   const body = log.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([head + '\n' + body], { type: 'text/csv' }));
