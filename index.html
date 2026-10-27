@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sortermaskin BLE-vakt</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;700&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: kontrollbånd øverst, så ett kort per sensor i et rutenett som blir én kolonne på telefon */
+:root {
+  --bg: #eef0ee; --panel: #ffffff; --fg: #1b2420; --muted: #5d6a63; --line: #d3d9d5;
+  --accent: #c8102e;            /* Posten-rød som aksent */
+  --ok: #1f7a4d; --warn: #b26b00; --crit: #c8102e;
+  --font-head: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #121614; --panel: #1b201d; --fg: #e4ebe7; --muted: #94a39b; --line: #2c3430;
+          --accent: #ff4d63; --ok: #4cc28a; --warn: #f0a640; --crit: #ff4d63; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 16px 40px; }
+h1 { font-family: var(--font-head); font-size: 1.6rem; margin: 0; letter-spacing: .01em; text-wrap: balance; }
+.sub { color: var(--muted); margin: 2px 0 14px; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+button { font: 600 15px var(--font-head); border: 1px solid var(--line); background: var(--panel); color: var(--fg);
+  padding: 10px 14px; border-radius: 6px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+label.chk { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+.status { font-family: var(--font-mono); font-size: 13px; color: var(--muted); }
+.notice { border: 1px solid var(--warn); background: var(--panel); border-radius: 6px; padding: 12px 14px; margin-bottom: 12px; }
+.notice code { font-family: var(--font-mono); font-size: 13px; word-break: break-all; }
+.limits { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; color: var(--muted); font-size: 14px; }
+.limits input { width: 70px; font: 14px var(--font-mono); padding: 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--fg); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0;
+  border-left: 5px solid var(--line); }
+.card.ok { border-left-color: var(--ok); } .card.warn { border-left-color: var(--warn); } .card.crit { border-left-color: var(--crit); }
+.head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.name { font: 700 1.15rem var(--font-head); overflow-wrap: anywhere; }
+.pill { font: 600 12px var(--font-mono); padding: 2px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); } .pill.crit { color: var(--crit); } .pill.idle { color: var(--muted); }
+.place { width: 100%; margin: 6px 0 8px; font: 14px system-ui; padding: 6px 8px; border: 1px dashed var(--line); border-radius: 4px; background: transparent; color: var(--fg); }
+.vals { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px 10px; margin: 6px 0; }
+.v b { display: block; font: 600 1.25rem var(--font-mono); font-variant-numeric: tabular-nums; }
+.v span { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+canvas { width: 100%; height: 56px; display: block; margin: 4px 0; }
+details { margin-top: 6px; } summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+pre { font: 12px/1.5 var(--font-mono); white-space: pre-wrap; word-break: break-all; margin: 6px 0 0; color: var(--muted); }
+.empty { color: var(--muted); padding: 24px 0; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<h1>Sortermaskin BLE-vakt</h1>
+<p class="sub">Telefonen lytter på MOKO-sensorene (M4 Pro, M5, DL002) og viser temperatur, vibrasjon og batteri.</p>
+
+<div id="support" class="notice" hidden></div>
+
+<div class="bar">
+  <button id="start" class="primary">Start skanning</button>
+  <button id="stop" hidden>Stopp</button>
+  <button id="csv">Last ned logg (CSV)</button>
+  <label class="chk"><input type="checkbox" id="onlyMoko" checked> Bare MOKO-enheter</label>
+  <span id="status" class="status">Ikke startet</span>
+</div>
+
+<div class="limits">
+  <label>Varsel temp °C <input id="tWarn" type="number" value="55"></label>
+  <label>Alarm temp °C <input id="tCrit" type="number" value="70"></label>
+  <label>Varsel vibrasjon <input id="vWarn" type="number" value="80"></label>
+  <label>Alarm vibrasjon <input id="vCrit" type="number" value="200"></label>
+</div>
+
+<div id="grid" class="grid"><p class="empty">Trykk «Start skanning». Sensorene dukker opp her etter hvert som de sender.</p></div>
+
+<script>
+// ---- hjelpere ----
+const $ = id => document.getElementById(id);
+const hex = dv => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+                set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
+const places = store.get('places', {});
+const devices = new Map();      // id -> tilstand
+const log = [];                 // rader til CSV
+const MOKO_NAME = /^(MK|M4|M5|DL|BXP|BeaconX|MOKO|H4|H5|S0)/i;
+const UUID16 = n => `0000${n}-0000-1000-8000-00805f9b34fb`;
+
+// ---- dekoding ----
+// Eddystone TLM (0xFEAA, ramme 0x20): offisielt format
+function decodeEddystone(dv) {
+  const out = {};
+  if (dv.getUint8(0) === 0x20 && dv.byteLength >= 14) {
+    const mv = dv.getUint16(2);
+    if (mv) out.batt_mV = mv;
+    if (dv.getUint16(4) !== 0x8000) out.temp = dv.getInt16(4) / 256;
+    out.uptime_h = +(dv.getUint32(10) / 36000).toFixed(1);
+    out.frame = 'Eddystone TLM';
+  } else out.frame = 'Eddystone 0x' + dv.getUint8(0).toString(16);
+  return out;
+}
+// MOKO Sensor Info (0xEA01), fra MKSensor-SDK (AdvInfoParser.getSensorInfo), big-endian:
+// [0] rammetype, [1] flagg (0x01 hall åpen, 0x02 i bevegelse, 0x04 aks. på, 0x08 temp på, 0x10 fukt på),
+// [2-3] hall-teller, [4-5] bevegelsesteller, [6-11] X/Y/Z i mg (int16), [12-13] temp/10 °C,
+// [14-15] fukt/10 %RH, [16-17] batteri mV, [18..] tag-ID. Gjelder M4P, M5 og H4 Pro.
+function decodeSensorInfo(dv) {
+  if (dv.byteLength < 18) return { frame: 'MOKO 0xEA01 (kort)' };
+  const f = dv.getUint8(1), out = { frame: 'MOKO Sensor Info' };
+  if (f & 0x04) { out.ax = dv.getInt16(6); out.ay = dv.getInt16(8); out.az = dv.getInt16(10); out.moving = !!(f & 0x02); }
+  if (f & 0x08) out.temp = dv.getInt16(12) / 10;
+  if (f & 0x10) out.hum = dv.getUint16(14) / 10;
+  out.batt_mV = dv.getUint16(16);
+  if (dv.byteLength > 18) out.tag = hex(new DataView(dv.buffer, dv.byteOffset + 18, dv.byteLength - 18));
+  return out;
+}
+// Produksjonstest-ramme (0xEB01): batteri i byte 1-2
+function decodeProdTest(dv) { return dv.byteLength >= 3 ? { frame: 'MOKO prodtest', batt_mV: dv.getUint16(1) } : {}; }
+
+// Vibrasjonsindeks: standardavvik i |a| over de siste prøvene (rå akselerometer-enheter)
+function vibration(d) {
+  const m = d.acc.slice(-20).map(a => Math.hypot(a[0], a[1], a[2]));
+  if (m.length < 3) return null;
+  const mean = m.reduce((s, x) => s + x, 0) / m.length;
+  return Math.sqrt(m.reduce((s, x) => s + (x - mean) ** 2, 0) / m.length);
+}
+
+function onAdvert(ev) {
+  const id = ev.device.id, name = ev.device.name || ev.name || '';
+  const svc = {}, mfg = {};
+  ev.serviceData.forEach((dv, uuid) => svc[uuid] = dv);
+  ev.manufacturerData.forEach((dv, cid) => mfg[cid] = dv);
+  const isMoko = MOKO_NAME.test(name) || Object.keys(svc).some(u => /^0000(ea01|eb01|feab|feaa)/i.test(u));
+  if ($('onlyMoko').checked && !isMoko) return;
+
+  let d = devices.get(id);
+  if (!d) { d = { id, name, raw: {}, temps: [], acc: [], vib: [], vals: {} }; devices.set(id, d); }
+  if (name) d.name = name;
+  d.rssi = ev.rssi; d.seen = Date.now();
+
+  const decoded = {};
+  for (const [uuid, dv] of Object.entries(svc)) {
+    const short = uuid.slice(4, 8).toUpperCase();
+    d.raw['svc ' + short + ' ' + (dv.byteLength ? dv.getUint8(0).toString(16) : '')] = hex(dv);
+    if (short === 'FEAA') Object.assign(decoded, decodeEddystone(dv));
+    else if (short === 'EA01') Object.assign(decoded, decodeSensorInfo(dv));
+    else if (short === 'EB01') Object.assign(decoded, decodeProdTest(dv));
+  }
+  for (const [cid, dv] of Object.entries(mfg)) d.raw['mfg 0x' + (+cid).toString(16).padStart(4, '0')] = hex(dv);
+
+  if (decoded.temp != null && decoded.temp > -40 && decoded.temp < 125) { d.vals.temp = decoded.temp; d.temps.push(decoded.temp); }
+  if (decoded.hum != null && decoded.hum <= 100) d.vals.hum = decoded.hum;
+  if (decoded.batt_mV) d.vals.batt = decoded.batt_mV;
+  if (decoded.ax != null) {
+    d.acc.push([decoded.ax, decoded.ay, decoded.az]); d.vals.xyz = `${decoded.ax} / ${decoded.ay} / ${decoded.az} mg`;
+    d.vals.moving = decoded.moving;
+    const v = vibration(d); if (v != null) { d.vals.vib = v; d.vib.push(v); }
+  }
+  d.frames = decoded.frame || d.frames;
+  for (const k of ['temps', 'acc', 'vib']) if (d[k].length > 300) d[k].splice(0, d[k].length - 300);
+
+  log.push([new Date().toISOString(), id, d.name, places[id] || '', ev.rssi, d.vals.temp ?? '', d.vals.hum ?? '', d.vals.vib?.toFixed(1) ?? '', d.vals.batt ?? '',
+            Object.entries(d.raw).map(([k, v]) => k + '=' + v).join(' ')]);
+  if (log.length > 50000) log.splice(0, 10000);
+  scheduleRender();
+}
+
+// ---- visning ----
+let pending = false;
+function scheduleRender() { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; render(); }); } }
+
+function level(d) {
+  const L = id => +$(id).value;
+  if (Date.now() - d.seen > 60000) return 'idle';
+  if ((d.vals.temp ?? -99) >= L('tCrit') || (d.vals.vib ?? 0) >= L('vCrit')) return 'crit';
+  if ((d.vals.temp ?? -99) >= L('tWarn') || (d.vals.vib ?? 0) >= L('vWarn')) return 'warn';
+  return 'ok';
+}
+const LABEL = { ok: 'OK', warn: 'VARSEL', crit: 'ALARM', idle: 'STILLE' };
+
+function spark(cv, series, color) {
+  const r = cv.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  const g = cv.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, r.width, r.height);
+  if (series.length < 2) return;
+  const lo = Math.min(...series), hi = Math.max(...series), span = hi - lo || 1;
+  const x = i => i / (series.length - 1) * (r.width - 6) + 3, y = v => r.height - 4 - (v - lo) / span * (r.height - 8);
+  g.beginPath(); series.forEach((v, i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v)));
+  g.strokeStyle = color; g.lineWidth = 1.6; g.stroke();
+  g.lineTo(x(series.length - 1), r.height); g.lineTo(x(0), r.height); g.closePath();
+  g.globalAlpha = .12; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
+  g.beginPath(); g.arc(x(series.length - 1), y(series.at(-1)), 3, 0, 7); g.fill();
+}
+
+function render() {
+  const grid = $('grid');
+  if (!devices.size) return;
+  if (grid.querySelector('.empty')) grid.innerHTML = '';
+  const css = getComputedStyle(document.documentElement);
+  for (const d of [...devices.values()].sort((a, b) => (a.name || 'zz').localeCompare(b.name || 'zz'))) {
+    let el = grid.querySelector(`[data-id="${CSS.escape(d.id)}"]`);
+    if (!el) {
+      el = document.createElement('div'); el.className = 'card'; el.dataset.id = d.id;
+      el.innerHTML = `<div class="head"><span class="name"></span><span class="pill"></span></div>
+        <input class="place" id="place-${d.id.replace(/\W/g, '')}" placeholder="Plassering, f.eks. Motor 3 – drivlager">
+        <div class="vals">
+          <div class="v"><b data-k="temp">–</b><span>Temp °C</span></div>
+          <div class="v"><b data-k="vib">–</b><span>Vibrasjon mg</span></div>
+          <div class="v"><b data-k="batt">–</b><span>Batteri V</span></div>
+          <div class="v"><b data-k="hum">–</b><span>Fukt %</span></div>
+          <div class="v"><b data-k="rssi">–</b><span>Signal dBm</span></div>
+          <div class="v"><b data-k="age">–</b><span>Sist hørt</span></div>
+        </div>
+        <canvas data-c="temp" aria-label="Temperaturtrend"></canvas>
+        <canvas data-c="vib" aria-label="Vibrasjonstrend"></canvas>
+        <details><summary>Rådata</summary><pre></pre></details>`;
+      const inp = el.querySelector('.place'); inp.value = places[d.id] || '';
+      inp.addEventListener('change', () => { places[d.id] = inp.value; store.set('places', places); });
+      grid.appendChild(el);
+    }
+    const lv = level(d);
+    el.className = 'card ' + lv;
+    el.querySelector('.name').textContent = d.name || 'Ukjent ' + d.id.slice(0, 6);
+    const pill = el.querySelector('.pill'); pill.className = 'pill ' + lv; pill.textContent = LABEL[lv];
+    const set = (k, v) => el.querySelector(`[data-k="${k}"]`).textContent = v;
+    set('temp', d.vals.temp?.toFixed(1) ?? '–'); set('vib', d.vals.vib?.toFixed(0) ?? '–');
+    set('batt', d.vals.batt ? (d.vals.batt / 1000).toFixed(2) : '–'); set('hum', d.vals.hum?.toFixed(0) ?? '–');
+    set('rssi', d.rssi ?? '–'); set('age', Math.round((Date.now() - d.seen) / 1000) + ' s');
+    el.querySelector('[data-c="temp"]').hidden = d.temps.length < 2;
+    el.querySelector('[data-c="vib"]').hidden = d.vib.length < 2;
+    spark(el.querySelector('[data-c="temp"]'), d.temps.slice(-120), css.getPropertyValue('--accent'));
+    spark(el.querySelector('[data-c="vib"]'), d.vib.slice(-120), css.getPropertyValue('--warn'));
+    el.querySelector('pre').textContent = `Ramme: ${d.frames || '–'}\nX/Y/Z: ${d.vals.xyz || '–'}` +
+      (d.vals.moving == null ? '' : d.vals.moving ? ' (i bevegelse)' : ' (i ro)') + `\nID: ${d.id}\n` + Object.entries(d.raw).map(([k, v]) => k + ': ' + v).join('\n');
+  }
+}
+setInterval(scheduleRender, 2000);
+
+// ---- skanning ----
+let scan = null;
+function checkSupport() {
+  const box = $('support');
+  if (!('bluetooth' in navigator)) {
+    box.innerHTML = 'Denne nettleseren har ikke Web Bluetooth. Åpne siden i <b>Chrome på Android</b>.'; box.hidden = false; return false;
+  }
+  if (!navigator.bluetooth.requestLEScan) {
+    box.innerHTML = 'Chrome må få lov til å lytte etter sensorer: åpne <code>chrome://flags/#enable-experimental-web-platform-features</code>, sett den til <b>Enabled</b> og start Chrome på nytt.';
+    box.hidden = false; return false;
+  }
+  return true;
+}
+$('start').onclick = async () => {
+  if (!checkSupport()) return;
+  try {
+    scan = await navigator.bluetooth.requestLEScan({ acceptAllAdvertisements: true, keepRepeatedDevices: true });
+    navigator.bluetooth.addEventListener('advertisementreceived', onAdvert);
+    $('status').textContent = 'Skanner …'; $('start').hidden = true; $('stop').hidden = false;
+    try { await navigator.wakeLock?.request('screen'); } catch {}
+  } catch (e) {
+    $('status').textContent = 'Kunne ikke starte: ' + e.message + '. Sjekk at Bluetooth og posisjon er slått på.';
+  }
+};
+$('stop').onclick = () => {
+  scan?.stop(); navigator.bluetooth.removeEventListener('advertisementreceived', onAdvert);
+  $('status').textContent = 'Stoppet'; $('start').hidden = false; $('stop').hidden = true;
+};
+$('csv').onclick = () => {
+  const head = 'tid,id,navn,plassering,rssi,temp_c,fukt_pct,vibrasjon,batteri_mv,radata';
+  const body = log.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([head + '\n' + body], { type: 'text/csv' }));
+  a.download = 'moko-logg-' + new Date().toISOString().slice(0, 16).replace(/:/g, '') + '.csv'; a.click();
+};
+checkSupport();
+</script>
+</body>
+</html>
